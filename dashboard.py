@@ -126,15 +126,30 @@ if uploaded_file:
         st.plotly_chart(fig4, use_container_width=True)
 
     elif selected_tab == "💸 Unpaid Appointments":
-        unpaid = data[data['Unpaid revenue'] > 0].copy()
-        if not unpaid.empty:
-            unpaid_display = unpaid[['First name', 'Last name', 'Primary number',
-                                     'Full address', 'Date', 'Time', 'Invoice ID', 'Pet name', 'Unpaid revenue']]
-            unpaid_display = unpaid_display.sort_values('Date', ascending=False)
-            st.dataframe(unpaid_display, use_container_width=True)
+        unpaid_df = data[data["Unpaid revenue"] > 0]
+        if unpaid_df.empty:
+            st.success("✅ All appointments are fully paid!")
         else:
-            st.success("🎉 No unpaid appointments found!")
+            st.warning(f"⚠️ {len(unpaid_df)} unpaid appointment(s) found.")
+            st.write("Below is the list of unpaid customers:")
 
+            columns_to_show = [
+                "First name", "Last name", "Primary number",
+                "Full address", "Date", "Time",
+                "Invoice ID", "Pet name", "Unpaid revenue"
+                ]
+            existing_columns = [col for col in columns_to_show if col in unpaid_df.columns]
+            unpaid_table = unpaid_df[existing_columns].copy().sort_values("Date")
+
+            st.dataframe(unpaid_table, use_container_width=True, hide_index=True)
+
+            st.download_button(
+                label="📥 Download Unpaid Appointments (CSV)",
+                data=unpaid_table.to_csv(index=False),
+                file_name="unpaid_appointments.csv",
+                mime="text/csv"
+            )
+    
     elif selected_tab == "❌ Cancellations":
         st.subheader("❌ Cancelled Appointments")
         cancel_file = st.file_uploader("Upload the cancelled appointments Excel file", type=["xlsx"], key="cancel_upload")
