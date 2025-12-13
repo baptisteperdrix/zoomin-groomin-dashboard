@@ -438,39 +438,17 @@ with gr.Blocks(title="Zoomin Groomin Dashboard") as demo:
         ],
     )
 
-# ---------------- BASIC AUTH ----------------
-security = HTTPBasic()
+# ---------------- FASTAPI APP (Gradio + Basic Auth) ----------------
+import os
+from fastapi import FastAPI
 
-def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
-    correct_username = os.environ.get("APP_USERNAME")
-    correct_password = os.environ.get("APP_PASSWORD")
-
-    if not correct_username or not correct_password:
-        raise HTTPException(status_code=500, detail="Auth not configured")
-
-    is_user = secrets.compare_digest(credentials.username, correct_username)
-    is_pass = secrets.compare_digest(credentials.password, correct_password)
-
-    if not (is_user and is_pass):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Basic"},
-        )
-
-    return credentials.username
-
-# ---------------- FASTAPI APP ----------------
 app = FastAPI()
 
-@app.get("/")
-def root():
-    return {"status": "ok"}
+def gradio_basic_auth(username: str, password: str) -> bool:
+    return (
+        username == os.environ.get("APP_USERNAME", "")
+        and password == os.environ.get("APP_PASSWORD", "")
+    )
 
-# Mount Gradio with auth
-app = gr.mount_gradio_app(
-    app,
-    demo,
-    path="/",
-    auth=authenticate
-)
+# Mount Gradio at the root path with auth
+app = gr.mount_gradio_app(app, demo, path="/", auth=gradio_basic_auth)
