@@ -1,6 +1,10 @@
 import pandas as pd
 import plotly.express as px
 import gradio as gr
+import os
+from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+import secrets
 
 
 # ---------------- CONFIG ----------------
@@ -434,4 +438,39 @@ with gr.Blocks(title="Zoomin Groomin Dashboard") as demo:
         ],
     )
 
-demo.launch()
+# ---------------- BASIC AUTH ----------------
+security = HTTPBasic()
+
+def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
+    correct_username = os.environ.get("APP_USERNAME")
+    correct_password = os.environ.get("APP_PASSWORD")
+
+    if not correct_username or not correct_password:
+        raise HTTPException(status_code=500, detail="Auth not configured")
+
+    is_user = secrets.compare_digest(credentials.username, correct_username)
+    is_pass = secrets.compare_digest(credentials.password, correct_password)
+
+    if not (is_user and is_pass):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+    return credentials.username
+
+# ---------------- FASTAPI APP ----------------
+app = FastAPI()
+
+@app.get("/")
+def root():
+    return {"status": "ok"}
+
+# Mount Gradio with auth
+app = gr.mount_gradio_app(
+    app,
+    demo,
+    path="/",
+    auth=authenticate
+)
