@@ -1,11 +1,11 @@
+import os
 import pandas as pd
 import plotly.express as px
 import gradio as gr
-import os
-from fastapi import FastAPI, Depends, HTTPException, status
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
-import secrets
+from fastapi import FastAPI
+from dotenv import load_dotenv
 
+load_dotenv()
 
 # ---------------- CONFIG ----------------
 VAN_LABEL_MAP = {
@@ -21,6 +21,9 @@ PALETTE_MONTHS = ["#72B7B2", "#B279A2", "#FF9DA6", "#9D755D"]
 UNASSIGNED_VAN_LABEL = "Unassigned van"
 UNASSIGNED_GROOMER_LABEL = "Unassigned Groomer"
 MOBILE_FEE_PHRASE = "Mobile Fee Convenience Charge"
+
+# Cash file expected columns
+CASH_REQUIRED_COLS = ["Payment method", "Payment amount"]
 
 
 # ---------------- DATA PREP ----------------
@@ -42,7 +45,6 @@ def prep_df(df: pd.DataFrame) -> pd.DataFrame:
 
     _to_num(df, "Total collected")
     _to_num(df, "Total unpaid")
-    _to_num(df, "Add-on net sales")
     _to_num(df, "Discount")
 
     # Van normalization
@@ -218,6 +220,22 @@ def avg_price_per_ticket(df: pd.DataFrame, total_df: pd.DataFrame) -> pd.DataFra
     return out
 
 
+def mobile_fee_pct_by_period(df: pd.DataFrame, period_order: list[str]) -> pd.DataFrame:
+    base = pd.DataFrame({"Period": period_order})
+
+    tickets = df.groupby("Period").size().rename("Ticket count")
+    if "Mobile fee count" in df.columns:
+        mobile = df.groupby("Period")["Mobile fee count"].sum()
+    else:
+        mobile = pd.Series(dtype=float)
+
+    out = base.copy()
+    out["Ticket count"] = out["Period"].map(tickets).fillna(0).astype(int)
+    out["Mobile fee count"] = out["Period"].map(mobile).fillna(0).astype(int)
+    out["Mobile fee %"] = (out["Mobile fee count"] / out["Ticket count"].replace(0, pd.NA)).fillna(0)
+    return out
+
+
 def unpaid_table_through_last_week(df: pd.DataFrame, last_week_end: pd.Timestamp) -> tuple[str, pd.DataFrame]:
     required = ["Client name", "Client email", "Pet name", "Sale date", "Total unpaid"]
     missing = [c for c in required if c not in df.columns]
@@ -231,8 +249,28 @@ def unpaid_table_through_last_week(df: pd.DataFrame, last_week_end: pd.Timestamp
     return "", unpaid
 
 
-# ---------------- FIGURE HELPERS ----------------
-def bar_money(df: pd.DataFrame, x: str, y: str, palette: list[str], title: str, order: list[str]):
+# ---------------- FIGURE HELPERS + GOAL LINE ----------------
+def add_goal_line(fig, goal_value, label="Goal", fmt=None):
+    if goal_value is None:
+        return fig
+    try:
+        g = float(goal_value)
+    except Exception:
+        return fig
+    if g == 0:
+        return fig
+
+    fig.add_hline(
+        y=g,
+        line_dash="dash",
+        line_width=2,
+        annotation_text=f"{label}: {fmt(g) if fmt else g}",
+        annotation_position="top left",
+    )
+    return fig
+
+
+def bar_money(df: pd.DataFrame, x: str, y: str, palette: list[str], title: str, order: list[str], goal=None):
     fig = px.bar(
         df,
         x=x,
@@ -245,10 +283,11 @@ def bar_money(df: pd.DataFrame, x: str, y: str, palette: list[str], title: str, 
     fig.update_yaxes(tickformat="$,.0f")
     fig.update_traces(texttemplate="$%{y:,.2f}", textposition="inside")
     fig.update_layout(showlegend=False)
+    fig = add_goal_line(fig, goal, "Goal", fmt=lambda v: f"${v:,.2f}")
     return fig
 
 
-def bar_count(df: pd.DataFrame, x: str, y: str, palette: list[str], title: str, order: list[str]):
+def bar_count(df: pd.DataFrame, x: str, y: str, palette: list[str], title: str, order: list[str], goal=None):
     fig = px.bar(
         df,
         x=x,
@@ -260,10 +299,36 @@ def bar_count(df: pd.DataFrame, x: str, y: str, palette: list[str], title: str, 
     )
     fig.update_traces(texttemplate="%{y}", textposition="inside")
     fig.update_layout(showlegend=False)
+    fig = add_goal_line(fig, goal, "Goal", fmt=lambda v: f"{int(round(v))}")
     return fig
 
 
-def bar_grouped_money(df: pd.DataFrame, x: str, y: str, group: str, title: str, order: list[str]):
+def bar_percent(df: pd.DataFrame, x: str, y: str, palette: list[str], title: str, order: list[str], goal_percent=None):
+    fig = px.bar(
+        df,
+        x=x,
+        y=y,
+        color=x,
+        color_discrete_sequence=palette,
+        title=title,
+        category_orders={x: order},
+    )
+    fig.update_yaxes(tickformat=".0%")
+    fig.update_traces(texttemplate="%{y:.1%}", textposition="inside")
+    fig.update_layout(showlegend=False)
+
+    if goal_percent is not None:
+        try:
+            gp = float(goal_percent)
+            if gp != 0:
+                fig = add_goal_line(fig, gp / 100.0, "Goal", fmt=lambda v: f"{v*100:.1f}%")
+        except Exception:
+            pass
+
+    return fig
+
+
+def bar_grouped_money(df: pd.DataFrame, x: str, y: str, group: str, title: str, order: list[str], goal=None):
     fig = px.bar(
         df,
         x=x,
@@ -275,13 +340,26 @@ def bar_grouped_money(df: pd.DataFrame, x: str, y: str, group: str, title: str, 
     )
     fig.update_yaxes(tickformat="$,.0f")
     fig.update_traces(texttemplate="$%{y:,.2f}", textposition="inside")
+    fig = add_goal_line(fig, goal, "Goal", fmt=lambda v: f"${v:,.2f}")
     return fig
 
 
-# ---------------- MAIN PROCESS ----------------
-def build_dashboard(file_obj):
+# ---------------- MAIN DASHBOARD PROCESS ----------------
+def build_dashboard(
+    file_obj,
+    goal_revenue_w, goal_revenue_m,
+    goal_avg_van_w, goal_avg_van_m,
+    goal_groomer_w, goal_groomer_m,
+    goal_pets_w, goal_pets_m,
+    goal_apt_w, goal_apt_m,
+    goal_mobile_pct_w, goal_mobile_pct_m,
+    goal_discounts_w, goal_discounts_m,
+):
+    # outputs: status + 14 plots + unpaid_msg + unpaid_table = 17 outputs
+    EMPTY_RET = ("Upload an Excel file to begin.",) + (None,) * 14 + ("", pd.DataFrame())
+
     if file_obj is None:
-        return ("Upload an Excel file to begin.", None, None, None, None, None, None, None, None, None, None, None)
+        return EMPTY_RET
 
     try:
         raw = pd.read_excel(file_obj.name, engine="openpyxl")
@@ -307,19 +385,20 @@ def build_dashboard(file_obj):
         pets_weeks = template_sum(weeks_df, weeks_order, "Pet count", round2=False)
         pets_months = template_sum(months_df, months_order, "Pet count", round2=False)
 
-        mobile_weeks = template_sum(weeks_df, weeks_order, "Mobile fee count", round2=False)
-        mobile_months = template_sum(months_df, months_order, "Mobile fee count", round2=False)
+        avg_ticket_weeks = avg_price_per_ticket(weeks_df, total_weeks)
+        avg_ticket_months = avg_price_per_ticket(months_df, total_months)
 
-        addons_weeks = template_sum(weeks_df, weeks_order, "Add-on net sales", round2=True)
-        addons_months = template_sum(months_df, months_order, "Add-on net sales", round2=True)
+        mobile_pct_weeks = mobile_fee_pct_by_period(weeks_df, weeks_order)
+        mobile_pct_months = mobile_fee_pct_by_period(months_df, months_order)
 
         discounts_weeks = template_sum(weeks_df, weeks_order, "Discount", round2=True)
         discounts_months = template_sum(months_df, months_order, "Discount", round2=True)
 
-        avg_ticket_weeks = avg_price_per_ticket(weeks_df, total_weeks)
-        avg_ticket_months = avg_price_per_ticket(months_df, total_months)
-
         unpaid_note, unpaid_df = unpaid_table_through_last_week(df, last_week_end)
+        if unpaid_df.empty and not unpaid_note:
+            unpaid_msg = f"🎉 No unpaid appointments through {last_week_end.date()} — great job staying on top of collections!"
+        else:
+            unpaid_msg = unpaid_note or f"Includes appointments up to {last_week_end.date()} (end of last completed week)."
 
         status = (
             f"✅ Loaded {len(df):,} rows\n\n"
@@ -328,120 +407,373 @@ def build_dashboard(file_obj):
             f"- Last completed month ends: **{last_month_end.date()}**\n"
             f"- Van count (excluding '{UNASSIGNED_VAN_LABEL}'): **{van_count}**\n"
         )
-        if unpaid_note:
-            status += f"\n{unpaid_note}\n"
 
-        # Figures
-        fig_total_weeks = bar_money(total_weeks, "Period", "Total collected", PALETTE_WEEKS, "Collected Revenue — Last 4 Weeks", weeks_order)
-        fig_total_months = bar_money(total_months, "Period", "Total collected", PALETTE_MONTHS, "Collected Revenue — Last 4 Months", months_order)
+        fig_total_weeks = bar_money(total_weeks, "Period", "Total collected", PALETTE_WEEKS, "Last 4 Weeks", weeks_order, goal=goal_revenue_w)
+        fig_total_months = bar_money(total_months, "Period", "Total collected", PALETTE_MONTHS, "Last 4 Months", months_order, goal=goal_revenue_m)
 
-        fig_avg_van_weeks = bar_money(avg_weeks, "Period", "Avg per Van", PALETTE_WEEKS, "Avg Collected Revenue / Van — Last 4 Weeks", weeks_order)
-        fig_avg_van_months = bar_money(avg_months, "Period", "Avg per Van", PALETTE_MONTHS, "Avg Collected Revenue / Van — Last 4 Months", months_order)
+        fig_avg_van_weeks = bar_money(avg_weeks, "Period", "Avg per Van", PALETTE_WEEKS, "Last 4 Weeks", weeks_order, goal=goal_avg_van_w)
+        fig_avg_van_months = bar_money(avg_months, "Period", "Avg per Van", PALETTE_MONTHS, "Last 4 Months", months_order, goal=goal_avg_van_m)
 
-        fig_groomer_weeks = bar_grouped_money(groomer_weeks, "Period", "Total collected", "Assigned staff", "Collected Revenue / Groomer — Last 4 Weeks", weeks_order)
-        fig_groomer_months = bar_grouped_money(groomer_months, "Period", "Total collected", "Assigned staff", "Collected Revenue / Groomer — Last 4 Months", months_order)
+        fig_groomer_weeks = bar_grouped_money(groomer_weeks, "Period", "Total collected", "Assigned staff", "Last 4 Weeks", weeks_order, goal=goal_groomer_w)
+        fig_groomer_months = bar_grouped_money(groomer_months, "Period", "Total collected", "Assigned staff", "Last 4 Months", months_order, goal=goal_groomer_m)
 
-        fig_pets_weeks = bar_count(pets_weeks, "Period", "Pet count", PALETTE_WEEKS, "# of Pets Serviced — Last 4 Weeks", weeks_order)
-        fig_pets_months = bar_count(pets_months, "Period", "Pet count", PALETTE_MONTHS, "# of Pets Serviced — Last 4 Months", months_order)
+        fig_pets_weeks = bar_count(pets_weeks, "Period", "Pet count", PALETTE_WEEKS, "Last 4 Weeks", weeks_order, goal=goal_pets_w)
+        fig_pets_months = bar_count(pets_months, "Period", "Pet count", PALETTE_MONTHS, "Last 4 Months", months_order, goal=goal_pets_m)
 
-        fig_avg_ticket_weeks = bar_money(avg_ticket_weeks, "Period", "Avg price per ticket", PALETTE_WEEKS, "Avg Price per Ticket — Last 4 Weeks", weeks_order)
-        fig_avg_ticket_months = bar_money(avg_ticket_months, "Period", "Avg price per ticket", PALETTE_MONTHS, "Avg Price per Ticket — Last 4 Months", months_order)
+        fig_apt_weeks = bar_money(avg_ticket_weeks, "Period", "Avg price per ticket", PALETTE_WEEKS, "Last 4 Weeks", weeks_order, goal=goal_apt_w)
+        fig_apt_months = bar_money(avg_ticket_months, "Period", "Avg price per ticket", PALETTE_MONTHS, "Last 4 Months", months_order, goal=goal_apt_m)
 
-        fig_mobile_weeks = bar_count(mobile_weeks, "Period", "Mobile fee count", PALETTE_WEEKS, "Mobile Convenience Fees Applied — Last 4 Weeks", weeks_order)
-        fig_mobile_months = bar_count(mobile_months, "Period", "Mobile fee count", PALETTE_MONTHS, "Mobile Convenience Fees Applied — Last 4 Months", months_order)
+        fig_mobile_weeks = bar_percent(mobile_pct_weeks, "Period", "Mobile fee %", PALETTE_WEEKS, "Last 4 Weeks", weeks_order, goal_percent=goal_mobile_pct_w)
+        fig_mobile_months = bar_percent(mobile_pct_months, "Period", "Mobile fee %", PALETTE_MONTHS, "Last 4 Months", months_order, goal_percent=goal_mobile_pct_m)
 
-        fig_addons_weeks = bar_money(addons_weeks, "Period", "Add-on net sales", PALETTE_WEEKS, "Add-on Revenue — Last 4 Weeks", weeks_order)
-        fig_addons_months = bar_money(addons_months, "Period", "Add-on net sales", PALETTE_MONTHS, "Add-on Revenue — Last 4 Months", months_order)
+        fig_discounts_weeks = bar_money(discounts_weeks, "Period", "Discount", PALETTE_WEEKS, "Last 4 Weeks", weeks_order, goal=goal_discounts_w)
+        fig_discounts_months = bar_money(discounts_months, "Period", "Discount", PALETTE_MONTHS, "Last 4 Months", months_order, goal=goal_discounts_m)
 
-        fig_discounts_weeks = bar_money(discounts_weeks, "Period", "Discount", PALETTE_WEEKS, "Discounts — Last 4 Weeks", weeks_order)
-        fig_discounts_months = bar_money(discounts_months, "Period", "Discount", PALETTE_MONTHS, "Discounts — Last 4 Months", months_order)
-
-        # Unpaid message
-        if unpaid_df.empty and not unpaid_note:
-            unpaid_msg = f"🎉 No unpaid appointments through {last_week_end.date()} — great job staying on top of collections!"
-        else:
-            unpaid_msg = f"Includes appointments up to {last_week_end.date()} (end of last completed week)."
-
-        # Return outputs in exact order defined in UI
         return (
             status,
             fig_total_weeks, fig_total_months,
             fig_avg_van_weeks, fig_avg_van_months,
             fig_groomer_weeks, fig_groomer_months,
             fig_pets_weeks, fig_pets_months,
-            fig_avg_ticket_weeks, fig_avg_ticket_months,
+            fig_apt_weeks, fig_apt_months,
             fig_mobile_weeks, fig_mobile_months,
-            fig_addons_weeks, fig_addons_months,
             fig_discounts_weeks, fig_discounts_months,
-            unpaid_msg, unpaid_df
+            unpaid_msg, unpaid_df,
         )
 
     except Exception as e:
         msg = f"❌ Error: {type(e).__name__}: {e}"
-        # Return Nones for figs/dfs
-        return (msg,) + (None,) * 18
+        return (msg,) + (None,) * 14 + ("", pd.DataFrame())
+
+
+# ---------------- CASH FILE LOGIC (NO DROPDOWN) ----------------
+def _is_cash_file(df: pd.DataFrame) -> bool:
+    cols = set(df.columns)
+    return all(c in cols for c in CASH_REQUIRED_COLS)
+
+
+def _date_like_cols_by_parsing(df: pd.DataFrame, min_parse_rate: float = 0.6) -> list[str]:
+    candidates = []
+    for c in df.columns:
+        try:
+            s = df[c]
+            non_null = s.dropna()
+            if non_null.empty:
+                continue
+            parsed = pd.to_datetime(non_null, errors="coerce")
+            rate = parsed.notna().mean()
+            if rate >= min_parse_rate:
+                candidates.append(c)
+        except Exception:
+            continue
+
+    preferred_order = [
+        "Transaction datetime",
+        "Transaction date",
+        "Payment date",
+        "Sale date",
+    ]
+    ordered = [c for c in preferred_order if c in candidates]
+    for c in candidates:
+        if c not in ordered:
+            ordered.append(c)
+    return ordered
+
+
+def _best_cash_date_col(df: pd.DataFrame) -> str | None:
+    cols = _date_like_cols_by_parsing(df, min_parse_rate=0.6)
+    return cols[0] if cols else None
+
+
+def _parse_user_date(s: str):
+    if s is None:
+        return None
+    s = str(s).strip()
+    if not s:
+        return None
+    try:
+        return pd.to_datetime(s, errors="raise").normalize()
+    except Exception:
+        return None
+
+
+def cash_ui_state(file_obj):
+    """
+    Returns:
+      cash_status_md, cash_container_update, cash_start_str, cash_end_str, cash_result_clear
+    """
+    if file_obj is None:
+        return (
+            "Upload a cash payments Excel file to calculate cash collected.",
+            gr.update(visible=False),
+            "",
+            "",
+            "",
+        )
+
+    try:
+        df = pd.read_excel(file_obj.name, engine="openpyxl")
+    except Exception as e:
+        return (
+            f"❌ Could not read file: {type(e).__name__}: {e}",
+            gr.update(visible=False),
+            "",
+            "",
+            "",
+        )
+
+    if not _is_cash_file(df):
+        return (
+            "⚠️ This doesn’t look like the cash payments file. "
+            "Required columns: **Payment method**, **Payment amount**. Nothing will display until a valid cash file is uploaded.",
+            gr.update(visible=False),
+            "",
+            "",
+            "",
+        )
+
+    date_col = _best_cash_date_col(df)
+    if not date_col:
+        return (
+            "✅ Cash file detected, but I couldn’t find any parseable date/datetime columns. "
+            "Make sure there is a transaction/payment date column in the file.",
+            gr.update(visible=True),
+            "",
+            "",
+            "",
+        )
+
+    parsed = pd.to_datetime(df[date_col], errors="coerce").dropna()
+    if parsed.empty:
+        return (
+            f"✅ Cash file detected, but **{date_col}** couldn’t be parsed as dates.",
+            gr.update(visible=True),
+            "",
+            "",
+            "",
+        )
+
+    min_d = parsed.min().date().isoformat()
+    max_d = parsed.max().date().isoformat()
+
+    msg = (
+        f"✅ Cash file detected.\n\n"
+        f"- Valid range: **{min_d}** to **{max_d}**\n\n"
+        f"Enter dates as `YYYY-MM-DD`."
+    )
+
+    return (
+        msg,
+        gr.update(visible=True),
+        min_d,
+        max_d,
+        "",
+    )
+
+
+def compute_cash_total(file_obj, start_str, end_str):
+    if file_obj is None:
+        return "Upload a payment transaction report first."
+
+    try:
+        df = pd.read_excel(file_obj.name, engine="openpyxl")
+    except Exception as e:
+        return f"❌ Could not read file: {type(e).__name__}: {e}"
+
+    if not _is_cash_file(df):
+        return "⚠️ Invalid payment transaction report. Required columns: **Payment method**, **Payment amount**."
+
+    date_col = _best_cash_date_col(df)
+    if not date_col:
+        return "⚠️ Could not find a valid date/datetime column in this file."
+
+    start = _parse_user_date(start_str)
+    end = _parse_user_date(end_str)
+    if start is None or end is None:
+        return "⚠️ Please enter valid dates in **YYYY-MM-DD** format for both start and end."
+
+    if end < start:
+        return "⚠️ End date must be on or after start date."
+
+    df = df.copy()
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df["Payment method"] = df["Payment method"].astype(str).str.strip().str.casefold()
+    df["Payment amount"] = pd.to_numeric(df["Payment amount"], errors="coerce").fillna(0)
+
+    # inclusive end-of-day for the end date
+    end_inclusive = end + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+
+    sub = df.loc[
+        df[date_col].notna() & (df[date_col] >= start) & (df[date_col] <= end_inclusive)
+    ].copy()
+
+    cash_total = sub.loc[sub["Payment method"].eq("cash"), "Payment amount"].sum()
+    check_total = sub.loc[sub["Payment method"].eq("check"), "Payment amount"].sum()
+    combined = cash_total + check_total
+
+    # BIG, clean output (cash + checks)
+    return (
+        f"# Collections from {start.date()} to {end.date()}\n\n"
+        f"## 💵 Cash: **${cash_total:,.2f}**\n"
+        f"## 🧾 Checks: **${check_total:,.2f}**\n\n"
+        f"### Total (Cash + Checks): **${combined:,.2f}**"
+    )
+
 
 
 # ---------------- GRADIO UI ----------------
 with gr.Blocks(title="Zoomin Groomin Dashboard") as demo:
-    gr.Markdown("# Zoomin Groomin Dashboard — Revenue")
-    file_in = gr.File(label="Upload Excel file (.xlsx)", file_types=[".xlsx", ".xls"])
+    gr.Markdown("# Zoomin Groomin Dashboard")
 
-    status = gr.Markdown()
+    file_in = gr.File(label="Upload Revenue Excel file (.xlsx)", file_types=[".xlsx", ".xls"])
+    status_md = gr.Markdown()
 
+    # ------- Revenue Tab -------
     with gr.Tab("Revenue"):
+        with gr.Accordion("Goals (Revenue tab)", open=False):
+            gr.Markdown("**Leave a goal blank to hide the goal line.** (A goal of 0 also hides the line.)")
+
+            with gr.Row():
+                goal_revenue_w = gr.Number(label="Goal: Collected Revenue (Weeks) $", value=None)
+                goal_revenue_m = gr.Number(label="Goal: Collected Revenue (Months) $", value=None)
+
+            with gr.Row():
+                goal_avg_van_w = gr.Number(label="Goal: Avg Revenue / Van (Weeks) $", value=None)
+                goal_avg_van_m = gr.Number(label="Goal: Avg Revenue / Van (Months) $", value=None)
+
+            with gr.Row():
+                goal_groomer_w = gr.Number(label="Goal: Revenue / Groomer (Weeks) $ — optional", value=None)
+                goal_groomer_m = gr.Number(label="Goal: Revenue / Groomer (Months) $ — optional", value=None)
+
+        gr.Markdown("## Collected Revenue")
         with gr.Row():
             rev_w = gr.Plot()
             rev_m = gr.Plot()
+
+        gr.Markdown("## Collected Revenue / Van")
         with gr.Row():
             avgv_w = gr.Plot()
             avgv_m = gr.Plot()
+
         gr.Markdown("## Collected Revenue / Groomer")
         groomer_w = gr.Plot()
         groomer_m = gr.Plot()
 
+    # ------- Ops KPIs Tab -------
     with gr.Tab("Ops KPIs"):
+        with gr.Accordion("Goals (Ops KPIs tab)", open=False):
+            gr.Markdown("**Leave a goal blank to hide the goal line.** (A goal of 0 also hides the line.)")
+
+            with gr.Row():
+                goal_pets_w = gr.Number(label="Goal: # Pets Serviced (Weeks)", value=None)
+                goal_pets_m = gr.Number(label="Goal: # Pets Serviced (Months)", value=None)
+
+            with gr.Row():
+                goal_apt_w = gr.Number(label="Goal: Avg Price per Ticket (Weeks) $", value=None)
+                goal_apt_m = gr.Number(label="Goal: Avg Price per Ticket (Months) $", value=None)
+
+            with gr.Row():
+                goal_mobile_pct_w = gr.Number(label="Goal: Mobile Fees % (Weeks) — enter like 25 for 25%", value=None)
+                goal_mobile_pct_m = gr.Number(label="Goal: Mobile Fees % (Months) — enter like 25 for 25%", value=None)
+
+            with gr.Row():
+                goal_discounts_w = gr.Number(label="Goal: Discounts (Weeks) $", value=None)
+                goal_discounts_m = gr.Number(label="Goal: Discounts (Months) $", value=None)
+
+        gr.Markdown("## Pets Serviced")
         with gr.Row():
             pets_w = gr.Plot()
             pets_m = gr.Plot()
+
+        gr.Markdown("## Average Price Per Ticket")
         with gr.Row():
             apt_w = gr.Plot()
             apt_m = gr.Plot()
+
+        gr.Markdown("## Mobile Convenience Fees Applied")
         with gr.Row():
             mobile_w = gr.Plot()
             mobile_m = gr.Plot()
-        with gr.Row():
-            addons_w = gr.Plot()
-            addons_m = gr.Plot()
+
+        gr.Markdown("## Discounts")
         with gr.Row():
             disc_w = gr.Plot()
             disc_m = gr.Plot()
 
+    # ------- Unpaid Tab -------
     with gr.Tab("Unpaid Appointments"):
         unpaid_msg = gr.Markdown()
         unpaid_table = gr.Dataframe(interactive=False)
 
-    file_in.change(
-        fn=build_dashboard,
-        inputs=file_in,
-        outputs=[
-            status,
-            rev_w, rev_m,
-            avgv_w, avgv_m,
-            groomer_w, groomer_m,
-            pets_w, pets_m,
-            apt_w, apt_m,
-            mobile_w, mobile_m,
-            addons_w, addons_m,
-            disc_w, disc_m,
-            unpaid_msg, unpaid_table
-        ],
+    # ------- Cash Collected Tab -------
+    with gr.Tab("Cash Collected"):
+        gr.Markdown(
+            "Upload the **payment transaction report** file here."
+        )
+        cash_file = gr.File(label="Upload Payment Transaction Report (.xlsx)", file_types=[".xlsx", ".xls"])
+
+        cash_status = gr.Markdown("Upload a cash payments Excel file to calculate cash collected.")
+        cash_container = gr.Group(visible=False)
+
+        with cash_container:
+            with gr.Row():
+                cash_start = gr.Textbox(label="Start date (YYYY-MM-DD)")
+                cash_end = gr.Textbox(label="End date (YYYY-MM-DD)")
+            cash_calc = gr.Button("Calculate Cash Collected")
+            cash_result = gr.Markdown()
+
+    # -------- DASHBOARD CALLBACK WIRING --------
+    inputs_list = [
+        file_in,
+        goal_revenue_w, goal_revenue_m,
+        goal_avg_van_w, goal_avg_van_m,
+        goal_groomer_w, goal_groomer_m,
+        goal_pets_w, goal_pets_m,
+        goal_apt_w, goal_apt_m,
+        goal_mobile_pct_w, goal_mobile_pct_m,
+        goal_discounts_w, goal_discounts_m,
+    ]
+
+    outputs_list = [
+        status_md,
+        rev_w, rev_m,
+        avgv_w, avgv_m,
+        groomer_w, groomer_m,
+        pets_w, pets_m,
+        apt_w, apt_m,
+        mobile_w, mobile_m,
+        disc_w, disc_m,
+        unpaid_msg, unpaid_table,
+    ]
+
+    file_in.change(fn=build_dashboard, inputs=inputs_list, outputs=outputs_list)
+
+    for g in [
+        goal_revenue_w, goal_revenue_m,
+        goal_avg_van_w, goal_avg_van_m,
+        goal_groomer_w, goal_groomer_m,
+        goal_pets_w, goal_pets_m,
+        goal_apt_w, goal_apt_m,
+        goal_mobile_pct_w, goal_mobile_pct_m,
+        goal_discounts_w, goal_discounts_m,
+    ]:
+        g.change(fn=build_dashboard, inputs=inputs_list, outputs=outputs_list)
+
+    # -------- CASH CALLBACK WIRING --------
+    cash_file.change(
+        fn=cash_ui_state,
+        inputs=[cash_file],
+        outputs=[cash_status, cash_container, cash_start, cash_end, cash_result],
     )
 
-# ---------------- FASTAPI APP (Gradio + Basic Auth) ----------------
-import os
-from fastapi import FastAPI
+    cash_calc.click(
+        fn=compute_cash_total,
+        inputs=[cash_file, cash_start, cash_end],
+        outputs=[cash_result],
+    )
 
+
+# ---------------- FASTAPI APP (Render) ----------------
 app = FastAPI()
 
 def gradio_basic_auth(username: str, password: str) -> bool:
@@ -450,5 +782,4 @@ def gradio_basic_auth(username: str, password: str) -> bool:
         and password == os.environ.get("APP_PASSWORD", "")
     )
 
-# Mount Gradio at the root path with auth
 app = gr.mount_gradio_app(app, demo, path="/", auth=gradio_basic_auth)
