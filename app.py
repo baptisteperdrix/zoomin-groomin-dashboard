@@ -22,8 +22,14 @@ UNASSIGNED_VAN_LABEL = "Unassigned van"
 UNASSIGNED_GROOMER_LABEL = "Unassigned Groomer"
 MOBILE_FEE_PHRASE = "Mobile Fee Convenience Charge"
 
-# Cash file expected columns
+# Payment transaction report expected columns for Cash/Checks
 CASH_REQUIRED_COLS = ["Payment method", "Payment amount"]
+
+# City/Zip expected columns (same Payment Transaction Report)
+CITYZIP_REQUIRED_COLS = ["City", "Zipcode"]
+
+# Appointment list report expected columns (Cancelled % KPI)
+APPT_REQUIRED_COLS = ["Appointment date", "Status"]
 
 
 # ---------------- DATA PREP ----------------
@@ -355,7 +361,6 @@ def build_dashboard(
     goal_mobile_pct_w, goal_mobile_pct_m,
     goal_discounts_w, goal_discounts_m,
 ):
-    # outputs: status + 14 plots + unpaid_msg + unpaid_table = 17 outputs
     EMPTY_RET = ("Upload an Excel file to begin.",) + (None,) * 14 + ("", pd.DataFrame())
 
     if file_obj is None:
@@ -504,7 +509,7 @@ def cash_ui_state(file_obj):
     """
     if file_obj is None:
         return (
-            "Upload a cash payments Excel file to calculate cash collected.",
+            "Upload a payment transaction report above to calculate cash collected.",
             gr.update(visible=False),
             "",
             "",
@@ -524,8 +529,8 @@ def cash_ui_state(file_obj):
 
     if not _is_cash_file(df):
         return (
-            "⚠️ This doesn’t look like the cash payments file. "
-            "Required columns: **Payment method**, **Payment amount**. Nothing will display until a valid cash file is uploaded.",
+            "⚠️ This doesn’t look like the payment transaction report. "
+            "Required columns: **Payment method**, **Payment amount**. Nothing will display until a valid report is uploaded.",
             gr.update(visible=False),
             "",
             "",
@@ -535,7 +540,7 @@ def cash_ui_state(file_obj):
     date_col = _best_cash_date_col(df)
     if not date_col:
         return (
-            "✅ Cash file detected, but I couldn’t find any parseable date/datetime columns. "
+            "✅ Payment transaction report detected, but I couldn’t find any parseable date/datetime columns. "
             "Make sure there is a transaction/payment date column in the file.",
             gr.update(visible=True),
             "",
@@ -546,7 +551,7 @@ def cash_ui_state(file_obj):
     parsed = pd.to_datetime(df[date_col], errors="coerce").dropna()
     if parsed.empty:
         return (
-            f"✅ Cash file detected, but **{date_col}** couldn’t be parsed as dates.",
+            f"✅ Payment transaction report detected, but **{date_col}** couldn’t be parsed as dates.",
             gr.update(visible=True),
             "",
             "",
@@ -557,7 +562,7 @@ def cash_ui_state(file_obj):
     max_d = parsed.max().date().isoformat()
 
     msg = (
-        f"✅ Cash file detected.\n\n"
+        f"✅ Payment transaction report detected.\n\n"
         f"- Valid range: **{min_d}** to **{max_d}**\n\n"
         f"Enter dates as `YYYY-MM-DD`."
     )
@@ -595,12 +600,25 @@ def compute_cash_total(file_obj, start_str, end_str):
     if end < start:
         return "⚠️ End date must be on or after start date."
 
+    parsed_dates = pd.to_datetime(df[date_col], errors="coerce").dropna()
+    if parsed_dates.empty:
+        return f"⚠️ I found the date column (**{date_col}**) but couldn’t parse any valid dates from it."
+
+    min_date = parsed_dates.min().normalize()
+    max_date = parsed_dates.max().normalize()
+
+    if start < min_date or end > max_date:
+        return (
+            "⚠️ Those dates aren’t available in this payment report.\n\n"
+            f"Valid range: **{min_date.date()}** to **{max_date.date()}**\n\n"
+            "Please enter dates within that range and try again."
+        )
+
     df = df.copy()
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
     df["Payment method"] = df["Payment method"].astype(str).str.strip().str.casefold()
     df["Payment amount"] = pd.to_numeric(df["Payment amount"], errors="coerce").fillna(0)
 
-    # inclusive end-of-day for the end date
     end_inclusive = end + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
 
     sub = df.loc[
@@ -611,7 +629,6 @@ def compute_cash_total(file_obj, start_str, end_str):
     check_total = sub.loc[sub["Payment method"].eq("check"), "Payment amount"].sum()
     combined = cash_total + check_total
 
-    # BIG, clean output (cash + checks)
     return (
         f"# Collections from {start.date()} to {end.date()}\n\n"
         f"## 💵 Cash: **${cash_total:,.2f}**\n"
@@ -620,13 +637,193 @@ def compute_cash_total(file_obj, start_str, end_str):
     )
 
 
+# ---------------- CITY / ZIP CHARTS (FROM PAYMENT TRANSACTION REPORT) ----------------
+def _top_n_with_other(s: pd.Series, n: int = 10, other_label: str = "Other") -> pd.DataFrame:
+    vc = s.value_counts(dropna=True)
+    if vc.empty:
+        return pd.DataFrame({"label": [], "count": []})
+
+    if len(vc) <= n:
+        return pd.DataFrame({"label": vc.index.astype(str), "count": vc.values})
+
+    top = vc.iloc[:n]
+    other = vc.iloc[n:].sum()
+    out = pd.DataFrame({"label": top.index.astype(str), "count": top.values})
+    if other > 0:
+        out = pd.concat(
+            [out, pd.DataFrame({"label": [other_label], "count": [other]})],
+            ignore_index=True,
+        )
+    return out
+
+
+def _clean_geo_col(series: pd.Series) -> pd.Series:
+    s = series.astype(str).str.strip()
+    s = s.replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
+    return s.dropna()
+
+
+def build_city_zip_charts(file_obj):
+    if file_obj is None:
+        return (
+            "Upload the **Payment Transaction Report** above to view Cities and Zip Codes served.",
+            None,
+            None,
+        )
+
+    try:
+        df = pd.read_excel(file_obj.name, engine="openpyxl")
+    except Exception as e:
+        return (f"❌ Could not read file: {type(e).__name__}: {e}", None, None)
+
+    missing = [c for c in CITYZIP_REQUIRED_COLS if c not in df.columns]
+    if missing:
+        return (
+            f"⚠️ This report is missing required column(s): **{', '.join(missing)}**.",
+            None,
+            None,
+        )
+
+    city_s = _clean_geo_col(df["City"])
+    zip_s = _clean_geo_col(df["Zipcode"]).astype(str).str.replace(r"\.0$", "", regex=True)
+
+    if city_s.empty and zip_s.empty:
+        return ("⚠️ City and Zipcode columns exist, but they are empty.", None, None)
+
+    city_df = _top_n_with_other(city_s, n=10, other_label="Other Cities")
+    zip_df = _top_n_with_other(zip_s, n=12, other_label="Other Zipcodes")
+
+    city_fig = None
+    zip_fig = None
+
+    if not city_df.empty:
+        city_fig = px.pie(city_df, names="label", values="count", title="Cities Served (Top 10)")
+        city_fig.update_traces(textinfo="percent+label", pull=[0.02] * len(city_df))
+        city_fig.update_layout(
+            legend=dict(orientation="v", yanchor="middle", y=0.5, xanchor="left", x=1.02),
+            margin=dict(l=20, r=160, t=60, b=20),
+        )
+
+    if not zip_df.empty:
+        zip_fig = px.pie(zip_df, names="label", values="count", title="Zip Codes Served (Top 12)")
+        zip_fig.update_traces(textinfo="percent+label")
+        zip_fig.update_layout(
+            legend=dict(orientation="v", yanchor="middle", y=0.5, xanchor="left", x=1.02),
+            margin=dict(l=20, r=160, t=60, b=20),
+        )
+
+    return "✅ Payment Transaction Report loaded — showing Cities and Zip Codes served.", city_fig, zip_fig
+
+
+# ---------------- CANCELLED APPOINTMENTS (APPOINTMENT LIST REPORT) ----------------
+def _is_appt_file(df: pd.DataFrame) -> bool:
+    cols = set(df.columns)
+    return all(c in cols for c in APPT_REQUIRED_COLS)
+
+
+def cancelled_pct_by_period(df: pd.DataFrame, period_order: list[str]) -> pd.DataFrame:
+    base = pd.DataFrame({"Period": period_order})
+
+    total = df.groupby("Period").size().rename("Total appts")
+    cancelled = df.groupby("Period")["Cancelled flag"].sum().rename("Cancelled appts")
+
+    out = base.copy()
+    out["Total appts"] = out["Period"].map(total).fillna(0).astype(int)
+    out["Cancelled appts"] = out["Period"].map(cancelled).fillna(0).astype(int)
+    out["Cancelled %"] = (out["Cancelled appts"] / out["Total appts"].replace(0, pd.NA)).fillna(0)
+    return out
+
+
+def build_cancelled_charts(appt_file_obj, goal_cancel_pct_w, goal_cancel_pct_m):
+    EMPTY = (
+        "Upload an **Appointment List Report** above to view cancelled appointment %.",
+        None,
+        None,
+    )
+
+    if appt_file_obj is None:
+        return EMPTY
+
+    try:
+        raw = pd.read_excel(appt_file_obj.name, engine="openpyxl")
+    except Exception as e:
+        return (f"❌ Could not read file: {type(e).__name__}: {e}", None, None)
+
+    if not _is_appt_file(raw):
+        missing = [c for c in APPT_REQUIRED_COLS if c not in raw.columns]
+        return (
+            "⚠️ This doesn’t look like the Appointment List Report.\n\n"
+            f"Missing required columns: **{', '.join(missing)}**",
+            None,
+            None,
+        )
+
+    df = raw.copy()
+    df["Appointment date"] = pd.to_datetime(df["Appointment date"], errors="coerce")
+    df = df[df["Appointment date"].notna()].copy()
+
+    if df.empty:
+        return ("⚠️ No valid Appointment dates found in this file.", None, None)
+
+    df["Status"] = df["Status"].astype(str).str.strip().str.casefold()
+    df["Cancelled flag"] = df["Status"].eq("cancel").astype(int)
+
+    # Reuse your existing completed-week/month logic by aliasing to "Sale date"
+    df["Sale date"] = df["Appointment date"]
+
+    anchor = df["Sale date"].max().normalize()
+
+    weeks_df, weeks_order, last_week_end = filter_last_4_completed_weeks(df, anchor)
+    months_df, months_order, last_month_end = filter_last_4_completed_months(df, anchor)
+
+    cancel_weeks = cancelled_pct_by_period(weeks_df, weeks_order)
+    cancel_months = cancelled_pct_by_period(months_df, months_order)
+
+    fig_cancel_weeks = bar_percent(
+        cancel_weeks,
+        x="Period",
+        y="Cancelled %",
+        palette=PALETTE_WEEKS,
+        title="Cancelled Appointments % — Last 4 Weeks",
+        order=weeks_order,
+        goal_percent=goal_cancel_pct_w,
+    )
+
+    fig_cancel_months = bar_percent(
+        cancel_months,
+        x="Period",
+        y="Cancelled %",
+        palette=PALETTE_MONTHS,
+        title="Cancelled Appointments % — Last 4 Months",
+        order=months_order,
+        goal_percent=goal_cancel_pct_m,
+    )
+
+    status = (
+        f"✅ Loaded {len(df):,} appointments\n\n"
+        f"- Anchor appointment date: **{anchor.date()}**\n"
+        f"- Last completed week ends: **{last_week_end.date()}**\n"
+        f"- Last completed month ends: **{last_month_end.date()}**\n"
+        f"- Total cancelled in file: **{int(df['Cancelled flag'].sum()):,}**\n"
+    )
+    return status, fig_cancel_weeks, fig_cancel_months
+
 
 # ---------------- GRADIO UI ----------------
 with gr.Blocks(title="Zoomin Groomin Dashboard") as demo:
     gr.Markdown("# Zoomin Groomin Dashboard")
 
-    file_in = gr.File(label="Upload Revenue Excel file (.xlsx)", file_types=[".xlsx", ".xls"])
+    # Report #1: Revenue export
+    file_in = gr.File(label="Upload Sales Invoice Report (.xlsx)", file_types=[".xlsx", ".xls"])
     status_md = gr.Markdown()
+
+    # Report #2: Payment Transaction Report (Cash/Checks + City/Zip)
+    gr.Markdown("## Payment Transaction Report (for Cash, Checks, Cities, Zip Codes)")
+    pt_file = gr.File(label="Upload Payment Transaction Report (.xlsx)", file_types=[".xlsx", ".xls"])
+
+    # Report #3: Appointment List Report (Cancelled %)
+    gr.Markdown("## Appointment List Report (for Cancelled Appointments %)")
+    appt_file = gr.File(label="Upload Appointment List Report (.xlsx)", file_types=[".xlsx", ".xls"])
 
     # ------- Revenue Tab -------
     with gr.Tab("Revenue"):
@@ -707,12 +904,8 @@ with gr.Blocks(title="Zoomin Groomin Dashboard") as demo:
 
     # ------- Cash Collected Tab -------
     with gr.Tab("Cash Collected"):
-        gr.Markdown(
-            "Upload the **payment transaction report** file here."
-        )
-        cash_file = gr.File(label="Upload Payment Transaction Report (.xlsx)", file_types=[".xlsx", ".xls"])
-
-        cash_status = gr.Markdown("Upload a cash payments Excel file to calculate cash collected.")
+        gr.Markdown("Uses the shared **Payment Transaction Report** uploaded above.")
+        cash_status = gr.Markdown("Upload a payment transaction report above to calculate cash collected.")
         cash_container = gr.Group(visible=False)
 
         with cash_container:
@@ -722,7 +915,29 @@ with gr.Blocks(title="Zoomin Groomin Dashboard") as demo:
             cash_calc = gr.Button("Calculate Cash Collected")
             cash_result = gr.Markdown()
 
-    # -------- DASHBOARD CALLBACK WIRING --------
+    # ------- Cities & Zip Codes Served Tab -------
+    with gr.Tab("Cities & Zip Codes Served"):
+        geo_status = gr.Markdown("Upload a payment transaction report above to view Cities and Zip Codes served.")
+        with gr.Row():
+            city_pie = gr.Plot()
+            zip_pie = gr.Plot()
+
+    # ------- Cancelled Appointments Tab -------
+    with gr.Tab("Cancelled Appointments"):
+        gr.Markdown("Uses the shared **Appointment List Report** uploaded above.")
+
+        with gr.Accordion("Goals (Cancelled Appointments tab)", open=False):
+            gr.Markdown("**Leave a goal blank to hide the goal line.** (A goal of 0 also hides the line.)")
+            with gr.Row():
+                goal_cancel_pct_w = gr.Number(label="Goal: Cancelled % (Weeks) — enter like 10 for 10%", value=None)
+                goal_cancel_pct_m = gr.Number(label="Goal: Cancelled % (Months) — enter like 10 for 10%", value=None)
+
+        cancel_status = gr.Markdown("Upload an **Appointment List Report** above to view cancelled appointment %.")
+        with gr.Row():
+            cancel_w = gr.Plot()
+            cancel_m = gr.Plot()
+
+    # -------- DASHBOARD CALLBACK WIRING (Revenue + Ops + Unpaid) --------
     inputs_list = [
         file_in,
         goal_revenue_w, goal_revenue_m,
@@ -759,18 +974,32 @@ with gr.Blocks(title="Zoomin Groomin Dashboard") as demo:
     ]:
         g.change(fn=build_dashboard, inputs=inputs_list, outputs=outputs_list)
 
-    # -------- CASH CALLBACK WIRING --------
-    cash_file.change(
+    # -------- PAYMENT TRANSACTION REPORT (SHARED) WIRING --------
+    pt_file.change(
         fn=cash_ui_state,
-        inputs=[cash_file],
+        inputs=[pt_file],
         outputs=[cash_status, cash_container, cash_start, cash_end, cash_result],
+    )
+
+    pt_file.change(
+        fn=build_city_zip_charts,
+        inputs=[pt_file],
+        outputs=[geo_status, city_pie, zip_pie],
     )
 
     cash_calc.click(
         fn=compute_cash_total,
-        inputs=[cash_file, cash_start, cash_end],
+        inputs=[pt_file, cash_start, cash_end],
         outputs=[cash_result],
     )
+
+    # -------- CANCELLED APPOINTMENTS (SHARED APPT FILE) WIRING --------
+    appt_inputs = [appt_file, goal_cancel_pct_w, goal_cancel_pct_m]
+    appt_outputs = [cancel_status, cancel_w, cancel_m]
+
+    appt_file.change(fn=build_cancelled_charts, inputs=appt_inputs, outputs=appt_outputs)
+    goal_cancel_pct_w.change(fn=build_cancelled_charts, inputs=appt_inputs, outputs=appt_outputs)
+    goal_cancel_pct_m.change(fn=build_cancelled_charts, inputs=appt_inputs, outputs=appt_outputs)
 
 
 # ---------------- FASTAPI APP (Render) ----------------
