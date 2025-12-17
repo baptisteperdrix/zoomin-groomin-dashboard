@@ -3,9 +3,9 @@ import pandas as pd
 import plotly.express as px
 import gradio as gr
 from fastapi import FastAPI
-#from dotenv import load_dotenv
+from dotenv import load_dotenv
 
-#load_dotenv()
+load_dotenv()
 
 # ---------------- CONFIG ----------------
 VAN_LABEL_MAP = {
@@ -30,6 +30,13 @@ CITYZIP_REQUIRED_COLS = ["City", "Zipcode"]
 
 # Appointment list report expected columns (Cancelled % KPI)
 APPT_REQUIRED_COLS = ["Appointment date", "Status"]
+
+# Pet type column (Appointment list report)
+PET_TYPE_COL = "Pet type"
+
+# Grooming report columns (Appointment list report)
+GROOM_REPORT_COL = "Has grooming report"
+STAFFS_COL = "Staffs"
 
 
 # ---------------- DATA PREP ----------------
@@ -276,6 +283,22 @@ def add_goal_line(fig, goal_value, label="Goal", fmt=None):
     return fig
 
 
+def _apply_plot_defaults(fig, y_max=None, percent=False):
+    fig.update_layout(uirevision=str(pd.Timestamp.utcnow().value))
+    fig.update_yaxes(autorange=True, fixedrange=False)
+    fig.update_xaxes(automargin=True, fixedrange=False)
+
+    if y_max is not None:
+        if percent:
+            top = min(1.0, max(0.05, y_max) * 1.15)
+            fig.update_yaxes(range=[0, top])
+        else:
+            top = max(1.0, y_max) * 1.20
+            fig.update_yaxes(range=[0, top])
+
+    return fig
+
+
 def bar_money(df: pd.DataFrame, x: str, y: str, palette: list[str], title: str, order: list[str], goal=None):
     fig = px.bar(
         df,
@@ -290,6 +313,8 @@ def bar_money(df: pd.DataFrame, x: str, y: str, palette: list[str], title: str, 
     fig.update_traces(texttemplate="$%{y:,.2f}", textposition="inside")
     fig.update_layout(showlegend=False)
     fig = add_goal_line(fig, goal, "Goal", fmt=lambda v: f"${v:,.2f}")
+    y_max = float(df[y].max()) if (y in df.columns and len(df)) else None
+    fig = _apply_plot_defaults(fig, y_max=y_max, percent=False)
     return fig
 
 
@@ -306,6 +331,8 @@ def bar_count(df: pd.DataFrame, x: str, y: str, palette: list[str], title: str, 
     fig.update_traces(texttemplate="%{y}", textposition="inside")
     fig.update_layout(showlegend=False)
     fig = add_goal_line(fig, goal, "Goal", fmt=lambda v: f"{int(round(v))}")
+    y_max = float(df[y].max()) if (y in df.columns and len(df)) else None
+    fig = _apply_plot_defaults(fig, y_max=y_max, percent=False)
     return fig
 
 
@@ -331,6 +358,8 @@ def bar_percent(df: pd.DataFrame, x: str, y: str, palette: list[str], title: str
         except Exception:
             pass
 
+    y_max = float(df[y].max()) if (y in df.columns and len(df)) else None
+    fig = _apply_plot_defaults(fig, y_max=y_max, percent=True)
     return fig
 
 
@@ -347,6 +376,34 @@ def bar_grouped_money(df: pd.DataFrame, x: str, y: str, group: str, title: str, 
     fig.update_yaxes(tickformat="$,.0f")
     fig.update_traces(texttemplate="$%{y:,.2f}", textposition="inside")
     fig = add_goal_line(fig, goal, "Goal", fmt=lambda v: f"${v:,.2f}")
+    y_max = float(df[y].max()) if (y in df.columns and len(df)) else None
+    fig = _apply_plot_defaults(fig, y_max=y_max, percent=False)
+    return fig
+
+
+def bar_grouped_percent(df: pd.DataFrame, x: str, y: str, group: str, title: str, order: list[str], goal_percent=None):
+    fig = px.bar(
+        df,
+        x=x,
+        y=y,
+        color=group,
+        barmode="group",
+        title=title,
+        category_orders={x: order},
+    )
+    fig.update_yaxes(tickformat=".0%")
+    fig.update_traces(texttemplate="%{y:.1%}", textposition="inside")
+
+    if goal_percent is not None:
+        try:
+            gp = float(goal_percent)
+            if gp != 0:
+                fig = add_goal_line(fig, gp / 100.0, "Goal", fmt=lambda v: f"{v*100:.1f}%")
+        except Exception:
+            pass
+
+    y_max = float(df[y].max()) if (y in df.columns and len(df)) else None
+    fig = _apply_plot_defaults(fig, y_max=y_max, percent=True)
     return fig
 
 
@@ -477,6 +534,9 @@ def _date_like_cols_by_parsing(df: pd.DataFrame, min_parse_rate: float = 0.6) ->
         "Transaction date",
         "Payment date",
         "Sale date",
+        "Date",
+        "Datetime",
+        "Created at",
     ]
     ordered = [c for c in preferred_order if c in candidates]
     for c in candidates:
@@ -503,10 +563,6 @@ def _parse_user_date(s: str):
 
 
 def cash_ui_state(file_obj):
-    """
-    Returns:
-      cash_status_md, cash_container_update, cash_start_str, cash_end_str, cash_result_clear
-    """
     if file_obj is None:
         return (
             "Upload a payment transaction report above to calculate cash collected.",
@@ -715,12 +771,189 @@ def build_city_zip_charts(file_obj):
     return "✅ Payment Transaction Report loaded — showing Cities and Zip Codes served.", city_fig, zip_fig
 
 
+# ---------------- PET TYPES PIE (LAST 4 COMPLETED MONTHS) ----------------
+def _pet_type_tokens_to_categories(val) -> list[str]:
+    """
+    Rules:
+      - "Cat,Dog" => counts as 1 Cat and 1 Dog
+      - Anything not Cat or Dog => Other
+      - Only 3 categories total: Cat, Dog, Other
+      - Avoid double-counting duplicates within the same cell
+    """
+    if pd.isna(val):
+        return []
+    s = str(val).strip()
+    if not s or s.lower() in {"nan", "none"}:
+        return []
+
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    cats = set()
+    for p in parts:
+        k = p.casefold()
+        if "cat" in k:
+            cats.add("Cat")
+        elif "dog" in k:
+            cats.add("Dog")
+        else:
+            cats.add("Other")
+    return list(cats)
+
+
+def build_pet_type_pie(appt_file_obj):
+    if appt_file_obj is None:
+        return "Upload an **Appointment List Report** above to view Pet Types.", None
+
+    try:
+        raw = pd.read_excel(appt_file_obj.name, engine="openpyxl")
+    except Exception as e:
+        return f"❌ Could not read file: {type(e).__name__}: {e}", None
+
+    if any(c not in raw.columns for c in ["Appointment date", "Status"]):
+        missing = [c for c in ["Appointment date", "Status"] if c not in raw.columns]
+        return (
+            "⚠️ This doesn’t look like the Appointment List Report.\n\n"
+            f"Missing required columns: **{', '.join(missing)}**",
+            None,
+        )
+
+    if PET_TYPE_COL not in raw.columns:
+        return f"⚠️ This Appointment List Report is missing the required column: **{PET_TYPE_COL}**.", None
+
+    df = raw.copy()
+    df["Appointment date"] = pd.to_datetime(df["Appointment date"], errors="coerce")
+    df = df[df["Appointment date"].notna()].copy()
+    if df.empty:
+        return "⚠️ No valid Appointment dates found in this file.", None
+
+    df["Sale date"] = df["Appointment date"]
+    anchor = df["Sale date"].max().normalize()
+
+    months_df, months_order, last_month_end = filter_last_4_completed_months(df, anchor)
+    if months_df.empty:
+        return "⚠️ No appointments fell within the last 4 completed months window.", None
+
+    cats_series = months_df[PET_TYPE_COL].apply(_pet_type_tokens_to_categories)
+    exploded = cats_series.explode().dropna()
+
+    if exploded.empty:
+        return "⚠️ Pet type column exists, but it’s empty for the last 4 completed months.", None
+
+    counts = exploded.value_counts()
+    out = pd.DataFrame(
+        {
+            "label": ["Cat", "Dog", "Other"],
+            "count": [int(counts.get("Cat", 0)), int(counts.get("Dog", 0)), int(counts.get("Other", 0))],
+        }
+    )
+
+    if out["count"].sum() == 0:
+        return "⚠️ Could not compute Pet Types counts for the last 4 completed months.", None
+
+    fig = px.pie(out, names="label", values="count", title="Pet Types — Last 4 Completed Months (Cat / Dog / Other)")
+    fig.update_traces(textinfo="percent+label")
+    fig.update_layout(
+        legend=dict(orientation="v", yanchor="middle", y=0.5, xanchor="left", x=1.02),
+        margin=dict(l=20, r=160, t=60, b=20),
+    )
+
+    msg = (
+        "✅ Appointment List Report loaded.\n\n"
+        f"- Last completed month ends: **{last_month_end.date()}**\n"
+        f"- Included months: **{', '.join(months_order)}**"
+    )
+    return msg, fig
+
+
+# ---------------- GROOMING REPORT % BY GROOMER (LAST 4 COMPLETED MONTHS) ----------------
+def _boolish_to_int(series: pd.Series) -> pd.Series:
+    if series.dtype == bool:
+        return series.astype(int)
+
+    txt = series.astype(str).str.strip().str.casefold()
+    truthy = {"true", "t", "yes", "y", "1", "checked", "completed", "done"}
+    falsy = {"false", "f", "no", "n", "0", "none", ""}
+
+    out = txt.apply(lambda v: 1 if v in truthy else (0 if v in falsy else 0))
+    return out.astype(int)
+
+
+def _normalize_staffs(series: pd.Series) -> pd.Series:
+    s = series.fillna("").astype(str).str.strip()
+    s = s.replace({"": UNASSIGNED_GROOMER_LABEL, "nan": UNASSIGNED_GROOMER_LABEL, "None": UNASSIGNED_GROOMER_LABEL})
+    s = s.apply(lambda v: v.split(",")[0].strip() if isinstance(v, str) and "," in v else v)
+    s = s.where(s.ne(""), UNASSIGNED_GROOMER_LABEL)
+    return s
+
+
+def build_grooming_report_pct(appt_file_obj, goal_gr_pct_m):
+    if appt_file_obj is None:
+        return "Upload an **Appointment List Report** above to view Grooming Report % by groomer.", None
+
+    try:
+        raw = pd.read_excel(appt_file_obj.name, engine="openpyxl")
+    except Exception as e:
+        return f"❌ Could not read file: {type(e).__name__}: {e}", None
+
+    required = ["Appointment date", "Status", STAFFS_COL, GROOM_REPORT_COL]
+    missing = [c for c in required if c not in raw.columns]
+    if missing:
+        return f"⚠️ Missing required column(s) for this KPI: **{', '.join(missing)}**.", None
+
+    df = raw.copy()
+    df["Appointment date"] = pd.to_datetime(df["Appointment date"], errors="coerce")
+    df = df[df["Appointment date"].notna()].copy()
+    if df.empty:
+        return "⚠️ No valid Appointment dates found in this file.", None
+
+    # ✅ FIX: Only consider Finished appointments (ignore Cancel, etc.)
+    df["Status_norm"] = df["Status"].astype(str).str.strip().str.casefold()
+    finished = df[df["Status_norm"].eq("finished")].copy()
+    if finished.empty:
+        return (
+            "⚠️ I didn’t find any appointments with **Status = Finished** in this file.\n\n"
+            "This Grooming Reports KPI only counts Finished appointments.",
+            None,
+        )
+
+    finished["Sale date"] = finished["Appointment date"]
+    anchor = finished["Sale date"].max().normalize()
+
+    months_df, months_order, last_month_end = filter_last_4_completed_months(finished, anchor)
+    if months_df.empty:
+        return "⚠️ No Finished appointments fell within the last 4 completed months window.", None
+
+    months_df = months_df.copy()
+    months_df["Staff"] = _normalize_staffs(months_df[STAFFS_COL])
+    months_df["Has report"] = _boolish_to_int(months_df[GROOM_REPORT_COL])
+
+    grp = (
+        months_df.groupby(["Period", "Staff"], as_index=False)
+        .agg(total_appts=("Has report", "size"), report_appts=("Has report", "sum"))
+    )
+    grp["Grooming report %"] = (grp["report_appts"] / grp["total_appts"].replace(0, pd.NA)).fillna(0)
+
+    fig = bar_grouped_percent(
+        grp,
+        x="Period",
+        y="Grooming report %",
+        group="Staff",
+        title="Grooming Reports Given — % of Finished Appointments (by Groomer) — Last 4 Completed Months",
+        order=months_order,
+        goal_percent=goal_gr_pct_m,
+    )
+    fig.update_layout(legend_title_text="Groomer")
+
+    msg = (
+        "✅ Appointment List Report loaded.\n\n"
+        f"- Filter: **Status = Finished only**\n"
+        f"- Last completed month ends: **{last_month_end.date()}**\n"
+        f"- Included months: **{', '.join(months_order)}**\n"
+        f"- Finished appointments in window: **{len(months_df):,}**"
+    )
+    return msg, fig
+
+
 # ---------------- CANCELLED APPOINTMENTS (APPOINTMENT LIST REPORT) ----------------
-def _is_appt_file(df: pd.DataFrame) -> bool:
-    cols = set(df.columns)
-    return all(c in cols for c in APPT_REQUIRED_COLS)
-
-
 def cancelled_pct_by_period(df: pd.DataFrame, period_order: list[str]) -> pd.DataFrame:
     base = pd.DataFrame({"Period": period_order})
 
@@ -735,22 +968,20 @@ def cancelled_pct_by_period(df: pd.DataFrame, period_order: list[str]) -> pd.Dat
 
 
 def build_cancelled_charts(appt_file_obj, goal_cancel_pct_w, goal_cancel_pct_m):
-    EMPTY = (
-        "Upload an **Appointment List Report** above to view cancelled appointment %.",
-        None,
-        None,
-    )
-
     if appt_file_obj is None:
-        return EMPTY
+        return (
+            "Upload an **Appointment List Report** above to view cancelled appointment %.",
+            None,
+            None,
+        )
 
     try:
         raw = pd.read_excel(appt_file_obj.name, engine="openpyxl")
     except Exception as e:
         return (f"❌ Could not read file: {type(e).__name__}: {e}", None, None)
 
-    if not _is_appt_file(raw):
-        missing = [c for c in APPT_REQUIRED_COLS if c not in raw.columns]
+    if any(c not in raw.columns for c in ["Appointment date", "Status"]):
+        missing = [c for c in ["Appointment date", "Status"] if c not in raw.columns]
         return (
             "⚠️ This doesn’t look like the Appointment List Report.\n\n"
             f"Missing required columns: **{', '.join(missing)}**",
@@ -761,16 +992,13 @@ def build_cancelled_charts(appt_file_obj, goal_cancel_pct_w, goal_cancel_pct_m):
     df = raw.copy()
     df["Appointment date"] = pd.to_datetime(df["Appointment date"], errors="coerce")
     df = df[df["Appointment date"].notna()].copy()
-
     if df.empty:
         return ("⚠️ No valid Appointment dates found in this file.", None, None)
 
     df["Status"] = df["Status"].astype(str).str.strip().str.casefold()
     df["Cancelled flag"] = df["Status"].eq("cancel").astype(int)
 
-    # Reuse your existing completed-week/month logic by aliasing to "Sale date"
     df["Sale date"] = df["Appointment date"]
-
     anchor = df["Sale date"].max().normalize()
 
     weeks_df, weeks_order, last_week_end = filter_last_4_completed_weeks(df, anchor)
@@ -780,23 +1008,15 @@ def build_cancelled_charts(appt_file_obj, goal_cancel_pct_w, goal_cancel_pct_m):
     cancel_months = cancelled_pct_by_period(months_df, months_order)
 
     fig_cancel_weeks = bar_percent(
-        cancel_weeks,
-        x="Period",
-        y="Cancelled %",
-        palette=PALETTE_WEEKS,
-        title="Cancelled Appointments % — Last 4 Weeks",
-        order=weeks_order,
-        goal_percent=goal_cancel_pct_w,
+        cancel_weeks, "Period", "Cancelled %",
+        PALETTE_WEEKS, "Cancelled Appointments % — Last 4 Weeks",
+        weeks_order, goal_percent=goal_cancel_pct_w
     )
 
     fig_cancel_months = bar_percent(
-        cancel_months,
-        x="Period",
-        y="Cancelled %",
-        palette=PALETTE_MONTHS,
-        title="Cancelled Appointments % — Last 4 Months",
-        order=months_order,
-        goal_percent=goal_cancel_pct_m,
+        cancel_months, "Period", "Cancelled %",
+        PALETTE_MONTHS, "Cancelled Appointments % — Last 4 Months",
+        months_order, goal_percent=goal_cancel_pct_m
     )
 
     status = (
@@ -814,15 +1034,15 @@ with gr.Blocks(title="Zoomin Groomin Dashboard") as demo:
     gr.Markdown("# Zoomin Groomin Dashboard")
 
     # Report #1: Revenue export
-    file_in = gr.File(label="Upload Sales Invoice Report (.xlsx)", file_types=[".xlsx", ".xls"])
+    file_in = gr.File(label="Upload Revenue Excel file (.xlsx)", file_types=[".xlsx", ".xls"])
     status_md = gr.Markdown()
 
     # Report #2: Payment Transaction Report (Cash/Checks + City/Zip)
     gr.Markdown("## Payment Transaction Report (for Cash, Checks, Cities, Zip Codes)")
     pt_file = gr.File(label="Upload Payment Transaction Report (.xlsx)", file_types=[".xlsx", ".xls"])
 
-    # Report #3: Appointment List Report (Cancelled %)
-    gr.Markdown("## Appointment List Report (for Cancelled Appointments %)")
+    # Report #3: Appointment List Report (for Cancelled %, Pet Types, Grooming Reports)")
+    gr.Markdown("## Appointment List Report (for Cancelled %, Pet Types, Grooming Reports)")
     appt_file = gr.File(label="Upload Appointment List Report (.xlsx)", file_types=[".xlsx", ".xls"])
 
     # ------- Revenue Tab -------
@@ -925,7 +1145,6 @@ with gr.Blocks(title="Zoomin Groomin Dashboard") as demo:
     # ------- Cancelled Appointments Tab -------
     with gr.Tab("Cancelled Appointments"):
         gr.Markdown("Uses the shared **Appointment List Report** uploaded above.")
-
         with gr.Accordion("Goals (Cancelled Appointments tab)", open=False):
             gr.Markdown("**Leave a goal blank to hide the goal line.** (A goal of 0 also hides the line.)")
             with gr.Row():
@@ -936,6 +1155,22 @@ with gr.Blocks(title="Zoomin Groomin Dashboard") as demo:
         with gr.Row():
             cancel_w = gr.Plot()
             cancel_m = gr.Plot()
+
+    # ------- Pet Types Tab -------
+    with gr.Tab("Pet Types"):
+        gr.Markdown("Uses the shared **Appointment List Report** uploaded above.")
+        pet_type_status = gr.Markdown("Upload an **Appointment List Report** above to view Pet Types.")
+        pet_type_pie = gr.Plot()
+
+    # ------- Grooming Reports Tab -------
+    with gr.Tab("Grooming Reports"):
+        gr.Markdown("Uses the shared **Appointment List Report** uploaded above.")
+        with gr.Accordion("Goals (Grooming Reports tab)", open=False):
+            gr.Markdown("**Leave a goal blank to hide the goal line.** (A goal of 0 also hides the line.)")
+            goal_gr_pct_m = gr.Number(label="Goal: Grooming Report % (Months) — enter like 90 for 90%", value=None)
+
+        gr_report_status = gr.Markdown("Upload an **Appointment List Report** above to view Grooming Report % by groomer.")
+        gr_report_fig = gr.Plot()
 
     # -------- DASHBOARD CALLBACK WIRING (Revenue + Ops + Unpaid) --------
     inputs_list = [
@@ -993,13 +1228,24 @@ with gr.Blocks(title="Zoomin Groomin Dashboard") as demo:
         outputs=[cash_result],
     )
 
-    # -------- CANCELLED APPOINTMENTS (SHARED APPT FILE) WIRING --------
-    appt_inputs = [appt_file, goal_cancel_pct_w, goal_cancel_pct_m]
-    appt_outputs = [cancel_status, cancel_w, cancel_m]
+    # -------- APPOINTMENT LIST REPORT (SHARED) WIRING --------
+    appt_inputs_cancel = [appt_file, goal_cancel_pct_w, goal_cancel_pct_m]
+    appt_outputs_cancel = [cancel_status, cancel_w, cancel_m]
 
-    appt_file.change(fn=build_cancelled_charts, inputs=appt_inputs, outputs=appt_outputs)
-    goal_cancel_pct_w.change(fn=build_cancelled_charts, inputs=appt_inputs, outputs=appt_outputs)
-    goal_cancel_pct_m.change(fn=build_cancelled_charts, inputs=appt_inputs, outputs=appt_outputs)
+    appt_file.change(fn=build_cancelled_charts, inputs=appt_inputs_cancel, outputs=appt_outputs_cancel)
+    goal_cancel_pct_w.change(fn=build_cancelled_charts, inputs=appt_inputs_cancel, outputs=appt_outputs_cancel)
+    goal_cancel_pct_m.change(fn=build_cancelled_charts, inputs=appt_inputs_cancel, outputs=appt_outputs_cancel)
+
+    appt_file.change(
+        fn=build_pet_type_pie,
+        inputs=[appt_file],
+        outputs=[pet_type_status, pet_type_pie],
+    )
+
+    appt_inputs_gr = [appt_file, goal_gr_pct_m]
+    appt_outputs_gr = [gr_report_status, gr_report_fig]
+    appt_file.change(fn=build_grooming_report_pct, inputs=appt_inputs_gr, outputs=appt_outputs_gr)
+    goal_gr_pct_m.change(fn=build_grooming_report_pct, inputs=appt_inputs_gr, outputs=appt_outputs_gr)
 
 
 # ---------------- FASTAPI APP (Render) ----------------
