@@ -3,9 +3,9 @@ import pandas as pd
 import plotly.express as px
 import gradio as gr
 from fastapi import FastAPI
-from dotenv import load_dotenv
+#from dotenv import load_dotenv
 
-load_dotenv()
+#load_dotenv()
 
 # ---------------- CONFIG ----------------
 VAN_LABEL_MAP = {
