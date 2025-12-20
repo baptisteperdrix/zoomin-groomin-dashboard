@@ -38,21 +38,41 @@ PET_TYPE_COL = "Pet type"
 GROOM_REPORT_COL = "Has grooming report"
 STAFFS_COL = "Staffs"
 
+# Tip rate needs these (same Payment Transaction Report)
+TIP_REQUIRED_COLS = ["Payment method", "Payment amount", "Assigned staff"]  # Tips column handled flexibly
 
-# ---------------- DATA PREP ----------------
+
+# ---------------- SMALL UTILS ----------------
+def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+def _get_col_case_insensitive(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    cols = {str(c).strip().casefold(): str(c).strip() for c in df.columns}
+    for cand in candidates:
+        key = str(cand).strip().casefold()
+        if key in cols:
+            return cols[key]
+    return None
+
+
 def _to_num(df: pd.DataFrame, col: str) -> None:
     if col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
 
+# ---------------- DATA PREP (REVENUE FILE) ----------------
 def prep_df(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
+    df = _normalize_cols(df)
 
     if "Sale date" not in df.columns:
         raise ValueError("Missing required column: 'Sale date'")
     if "Total collected" not in df.columns:
         raise ValueError("Missing required column: 'Total collected'")
 
+    df = df.copy()
     df["Sale date"] = pd.to_datetime(df["Sale date"], errors="coerce")
     df = df[df["Sale date"].notna()].copy()
 
@@ -174,7 +194,7 @@ def filter_last_4_completed_months(df: pd.DataFrame, anchor: pd.Timestamp):
     return sub, plot_order, end0
 
 
-# ---------------- AGGREGATIONS ----------------
+# ---------------- AGGREGATIONS (REVENUE FILE) ----------------
 def template_sum(df: pd.DataFrame, period_order: list[str], col: str, round2: bool = False) -> pd.DataFrame:
     base = pd.DataFrame({"Period": period_order})
     if col not in df.columns:
@@ -407,7 +427,7 @@ def bar_grouped_percent(df: pd.DataFrame, x: str, y: str, group: str, title: str
     return fig
 
 
-# ---------------- MAIN DASHBOARD PROCESS ----------------
+# ---------------- MAIN DASHBOARD PROCESS (REVENUE FILE) ----------------
 def build_dashboard(
     file_obj,
     goal_revenue_w, goal_revenue_m,
@@ -508,13 +528,16 @@ def build_dashboard(
         return (msg,) + (None,) * 14 + ("", pd.DataFrame())
 
 
-# ---------------- CASH FILE LOGIC (NO DROPDOWN) ----------------
+# ---------------- PAYMENT TRANSACTION REPORT (CASH/CHECKS + DATE DETECTION) ----------------
 def _is_cash_file(df: pd.DataFrame) -> bool:
+    df = _normalize_cols(df)
     cols = set(df.columns)
     return all(c in cols for c in CASH_REQUIRED_COLS)
 
 
 def _date_like_cols_by_parsing(df: pd.DataFrame, min_parse_rate: float = 0.6) -> list[str]:
+    df = _normalize_cols(df)
+
     candidates = []
     for c in df.columns:
         try:
@@ -574,6 +597,7 @@ def cash_ui_state(file_obj):
 
     try:
         df = pd.read_excel(file_obj.name, engine="openpyxl")
+        df = _normalize_cols(df)
     except Exception as e:
         return (
             f"❌ Could not read file: {type(e).__name__}: {e}",
@@ -638,6 +662,7 @@ def compute_cash_total(file_obj, start_str, end_str):
 
     try:
         df = pd.read_excel(file_obj.name, engine="openpyxl")
+        df = _normalize_cols(df)
     except Exception as e:
         return f"❌ Could not read file: {type(e).__name__}: {e}"
 
@@ -729,6 +754,7 @@ def build_city_zip_charts(file_obj):
 
     try:
         df = pd.read_excel(file_obj.name, engine="openpyxl")
+        df = _normalize_cols(df)
     except Exception as e:
         return (f"❌ Could not read file: {type(e).__name__}: {e}", None, None)
 
@@ -771,15 +797,154 @@ def build_city_zip_charts(file_obj):
     return "✅ Payment Transaction Report loaded — showing Cities and Zip Codes served.", city_fig, zip_fig
 
 
+# ---------------- TIP RATE (PAYMENT TRANSACTION REPORT) ----------------
+def _normalize_assigned_staff(series: pd.Series) -> pd.Series:
+    s = series.fillna("").astype(str).str.strip()
+    s = s.replace({"": UNASSIGNED_GROOMER_LABEL, "nan": UNASSIGNED_GROOMER_LABEL, "None": UNASSIGNED_GROOMER_LABEL})
+    s = s.where(s.ne(""), UNASSIGNED_GROOMER_LABEL)
+    return s
+
+
+def _tips_column_name(df: pd.DataFrame) -> str | None:
+    return _get_col_case_insensitive(df, ["Tips", "Tip", "Tip amount", "Tip Amount", "Gratuity", "Gratuity amount"])
+
+
+def build_tip_rate_charts(pt_file_obj, goal_tip_pct_w, goal_tip_pct_m):
+    """
+    Per your equation, per groomer + period, using NON-cash only:
+
+      Tip rate = ΣTips / (ΣPayment amount − ΣTips)
+
+    (Denominator is “amount before tips”; if it’s <= 0 we return 0 for safety.)
+    """
+    if pt_file_obj is None:
+        return (
+            "Upload the **Payment Transaction Report** above to view Tip Rate by groomer.",
+            None,
+            None,
+        )
+
+    try:
+        df = pd.read_excel(pt_file_obj.name, engine="openpyxl")
+        df = _normalize_cols(df)
+    except Exception as e:
+        return (f"❌ Could not read file: {type(e).__name__}: {e}", None, None)
+
+    missing = [c for c in TIP_REQUIRED_COLS if c not in df.columns]
+    if missing:
+        return (
+            "⚠️ This doesn’t look like the Payment Transaction Report needed for Tip Rate.\n\n"
+            f"Missing required columns: **{', '.join(missing)}**",
+            None,
+            None,
+        )
+
+    tips_col = _tips_column_name(df)
+    if tips_col is None:
+        return (
+            "⚠️ I couldn’t find a Tips column in this Payment Transaction Report.\n\n"
+            "I looked for: Tips / Tip / Tip amount / Gratuity.\n\n"
+            "If your report uses a different header, tell me the exact column name and I’ll map it.",
+            None,
+            None,
+        )
+
+    date_col = _best_cash_date_col(df)
+    if not date_col:
+        return (
+            "⚠️ Payment Transaction Report detected, but I couldn’t find a parseable date/datetime column to build weeks/months.",
+            None,
+            None,
+        )
+
+    work = df.copy()
+    work[date_col] = pd.to_datetime(work[date_col], errors="coerce")
+    work = work[work[date_col].notna()].copy()
+    if work.empty:
+        return ("⚠️ No valid transaction dates found in this report.", None, None)
+
+    work["Payment method"] = work["Payment method"].astype(str).str.strip().str.casefold()
+    work["Assigned staff"] = _normalize_assigned_staff(work["Assigned staff"])
+    work["Payment amount"] = pd.to_numeric(work["Payment amount"], errors="coerce").fillna(0)
+    work[tips_col] = pd.to_numeric(work[tips_col], errors="coerce").fillna(0)
+
+    # Only consider NON-cash transactions (cash tips are not reported)
+    work = work[work["Payment method"].ne("cash")].copy()
+    if work.empty:
+        return (
+            "⚠️ I didn’t find any NON-cash transactions in this report.\n\n"
+            "Tip Rate excludes Payment method = Cash (cash tips are not reported).",
+            None,
+            None,
+        )
+
+    # Period logic uses Sale date
+    work["Sale date"] = work[date_col].dt.normalize()
+    anchor = work["Sale date"].max().normalize()
+
+    weeks_df, weeks_order, last_week_end = filter_last_4_completed_weeks(work, anchor)
+    months_df, months_order, last_month_end = filter_last_4_completed_months(work, anchor)
+
+    if weeks_df.empty and months_df.empty:
+        return (
+            "⚠️ No NON-cash transactions fell into the last 4 completed weeks/months windows based on your report dates.",
+            None,
+            None,
+        )
+
+    def _ratio_totals(df_period: pd.DataFrame) -> pd.DataFrame:
+        grp = (
+            df_period.groupby(["Period", "Assigned staff"], as_index=False)
+            .agg(total_payment=("Payment amount", "sum"), total_tips=(tips_col, "sum"))
+        )
+        denom = (grp["total_payment"] - grp["total_tips"]).replace(0, pd.NA)
+
+        # If denom is <= 0, set rate to 0 (avoid negative/inf from messy data)
+        valid = (grp["total_payment"] - grp["total_tips"]) > 0
+        grp["Tip rate"] = 0.0
+        grp.loc[valid, "Tip rate"] = (grp.loc[valid, "total_tips"] / denom.loc[valid]).fillna(0)
+
+        # Tip rate can exceed 100% with this definition if tips > pre-tip amount; cap for display safety
+        grp["Tip rate"] = grp["Tip rate"].clip(lower=0)
+        return grp
+
+    tip_weeks = _ratio_totals(weeks_df)
+    tip_months = _ratio_totals(months_df)
+
+    fig_tip_weeks = bar_grouped_percent(
+        tip_weeks,
+        x="Period",
+        y="Tip rate",
+        group="Assigned staff",
+        title="Tip Rate by Groomer — Last 4 Weeks (NON-cash only)",
+        order=weeks_order,
+        goal_percent=goal_tip_pct_w,
+    )
+    fig_tip_months = bar_grouped_percent(
+        tip_months,
+        x="Period",
+        y="Tip rate",
+        group="Assigned staff",
+        title="Tip Rate by Groomer — Last 4 Months (NON-cash only)",
+        order=months_order,
+        goal_percent=goal_tip_pct_m,
+    )
+
+    status = (
+        "✅ Payment Transaction Report loaded for Tip Rate.\n\n"
+        f"- Using date column: **{date_col}**\n"
+        f"- Tips column: **{tips_col}**\n"
+        f"- Definition: **ΣTips / (ΣPayment amount − ΣTips)** (per groomer, per period)\n"
+        f"- Anchor transaction date: **{anchor.date()}**\n"
+        f"- Last completed week ends: **{last_week_end.date()}**\n"
+        f"- Last completed month ends: **{last_month_end.date()}**\n"
+        f"- Rows used (NON-cash): **{len(work):,}**"
+    )
+    return status, fig_tip_weeks, fig_tip_months
+
+
 # ---------------- PET TYPES PIE (LAST 4 COMPLETED MONTHS) ----------------
 def _pet_type_tokens_to_categories(val) -> list[str]:
-    """
-    Rules:
-      - "Cat,Dog" => counts as 1 Cat and 1 Dog
-      - Anything not Cat or Dog => Other
-      - Only 3 categories total: Cat, Dog, Other
-      - Avoid double-counting duplicates within the same cell
-    """
     if pd.isna(val):
         return []
     s = str(val).strip()
@@ -805,6 +970,7 @@ def build_pet_type_pie(appt_file_obj):
 
     try:
         raw = pd.read_excel(appt_file_obj.name, engine="openpyxl")
+        raw = _normalize_cols(raw)
     except Exception as e:
         return f"❌ Could not read file: {type(e).__name__}: {e}", None
 
@@ -891,6 +1057,7 @@ def build_grooming_report_pct(appt_file_obj, goal_gr_pct_m):
 
     try:
         raw = pd.read_excel(appt_file_obj.name, engine="openpyxl")
+        raw = _normalize_cols(raw)
     except Exception as e:
         return f"❌ Could not read file: {type(e).__name__}: {e}", None
 
@@ -905,7 +1072,7 @@ def build_grooming_report_pct(appt_file_obj, goal_gr_pct_m):
     if df.empty:
         return "⚠️ No valid Appointment dates found in this file.", None
 
-    # ✅ FIX: Only consider Finished appointments (ignore Cancel, etc.)
+    # Only consider Finished appointments
     df["Status_norm"] = df["Status"].astype(str).str.strip().str.casefold()
     finished = df[df["Status_norm"].eq("finished")].copy()
     if finished.empty:
@@ -977,6 +1144,7 @@ def build_cancelled_charts(appt_file_obj, goal_cancel_pct_w, goal_cancel_pct_m):
 
     try:
         raw = pd.read_excel(appt_file_obj.name, engine="openpyxl")
+        raw = _normalize_cols(raw)
     except Exception as e:
         return (f"❌ Could not read file: {type(e).__name__}: {e}", None, None)
 
@@ -1032,16 +1200,18 @@ def build_cancelled_charts(appt_file_obj, goal_cancel_pct_w, goal_cancel_pct_m):
 # ---------------- GRADIO UI ----------------
 with gr.Blocks(title="Zoomin Groomin Dashboard") as demo:
     gr.Markdown("# Zoomin Groomin Dashboard")
+    gr.Markdown('## For each report, make sure the file includes data from the last 4 COMPLETED months. Ex. If today is December 20, download the report from August 1 to December 20')
 
     # Report #1: Revenue export
-    file_in = gr.File(label="Upload Revenue Excel file (.xlsx)", file_types=[".xlsx", ".xls"])
+    gr.Markdown("## Sales Invoice Report (for Revenue, Ops KPI, and Unpaid Appointmens)")
+    file_in = gr.File(label="Upload Sales Invoice Report (.xlsx)", file_types=[".xlsx", ".xls"])
     status_md = gr.Markdown()
 
-    # Report #2: Payment Transaction Report (Cash/Checks + City/Zip)
-    gr.Markdown("## Payment Transaction Report (for Cash, Checks, Cities, Zip Codes)")
+    # Report #2: Payment Transaction Report (Cash/Checks + City/Zip + Tip Rate)
+    gr.Markdown("## Payment Transaction Report (for Cash, Checks, Cities, Zip Codes, Tip Rate)")
     pt_file = gr.File(label="Upload Payment Transaction Report (.xlsx)", file_types=[".xlsx", ".xls"])
 
-    # Report #3: Appointment List Report (for Cancelled %, Pet Types, Grooming Reports)")
+    # Report #3: Appointment List Report (Cancelled % + Pet Types + Grooming Reports)
     gr.Markdown("## Appointment List Report (for Cancelled %, Pet Types, Grooming Reports)")
     appt_file = gr.File(label="Upload Appointment List Report (.xlsx)", file_types=[".xlsx", ".xls"])
 
@@ -1142,6 +1312,23 @@ with gr.Blocks(title="Zoomin Groomin Dashboard") as demo:
             city_pie = gr.Plot()
             zip_pie = gr.Plot()
 
+    # ------- Tip Rate Tab -------
+    with gr.Tab("Tip Rate"):
+        gr.Markdown("Uses the shared **Payment Transaction Report** uploaded above. (Excludes Payment method = Cash.)")
+        with gr.Accordion("Goals (Tip Rate tab)", open=False):
+            gr.Markdown("**Leave a goal blank to hide the goal line.** (A goal of 0 also hides the line.)")
+            with gr.Row():
+                goal_tip_pct_w = gr.Number(label="Goal: Tip Rate (Weeks) — enter like 20 for 20%", value=None)
+                goal_tip_pct_m = gr.Number(label="Goal: Tip Rate (Months) — enter like 20 for 20%", value=None)
+
+        tip_status = gr.Markdown("Upload the **Payment Transaction Report** above to view Tip Rate by groomer.")
+
+        gr.Markdown("### Last 4 Weeks")
+        tip_w = gr.Plot()
+
+        gr.Markdown("### Last 4 Months")
+        tip_m = gr.Plot()
+
     # ------- Cancelled Appointments Tab -------
     with gr.Tab("Cancelled Appointments"):
         gr.Markdown("Uses the shared **Appointment List Report** uploaded above.")
@@ -1221,6 +1408,12 @@ with gr.Blocks(title="Zoomin Groomin Dashboard") as demo:
         inputs=[pt_file],
         outputs=[geo_status, city_pie, zip_pie],
     )
+
+    tip_inputs = [pt_file, goal_tip_pct_w, goal_tip_pct_m]
+    tip_outputs = [tip_status, tip_w, tip_m]
+    pt_file.change(fn=build_tip_rate_charts, inputs=tip_inputs, outputs=tip_outputs)
+    goal_tip_pct_w.change(fn=build_tip_rate_charts, inputs=tip_inputs, outputs=tip_outputs)
+    goal_tip_pct_m.change(fn=build_tip_rate_charts, inputs=tip_inputs, outputs=tip_outputs)
 
     cash_calc.click(
         fn=compute_cash_total,
